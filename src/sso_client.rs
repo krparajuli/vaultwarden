@@ -8,7 +8,6 @@ use once_cell::sync::Lazy;
 use openidconnect::core::*;
 use openidconnect::reqwest;
 use openidconnect::*;
-
 use crate::{
     api::{ApiResult, EmptyResult},
     db::models::SsoNonce,
@@ -167,7 +166,14 @@ impl Client {
         }
 
         match exchange.request_async(&self.http_client).await {
-            Err(err) => err!(format!("Failed to contact token endpoint: {:?}", err)),
+            Err(err) => {
+                match &err {
+                    RequestTokenError::Parse(_, _) => {
+                            err!(format!("Failed to decode token response: {}", err ))
+                    }
+                    _ => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
+                }
+            },
             Ok(token_response) => {
                 let oidc_nonce = Nonce::new(nonce.nonce);
 
