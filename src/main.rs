@@ -59,6 +59,7 @@ mod ratelimit;
 mod sso;
 mod sso_client;
 mod util;
+mod entra_sso_client;
 
 use crate::api::core::two_factor::duo_oidc::purge_duo_contexts;
 use crate::api::core::two_factor::webauthn::WEBAUTHN_2FA_CONFIG;

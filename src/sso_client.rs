@@ -2,6 +2,7 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::time::Duration;
 use url::Url;
+use serde_json::Value;
 
 use mini_moka::sync::Cache;
 use once_cell::sync::Lazy;
@@ -137,6 +138,68 @@ impl Client {
         Ok((auth_url, SsoNonce::new(state, nonce.secret().clone(), verifier, redirect_uri)))
     }
 
+    async fn perform_code_request(
+        &self,
+        code: OIDCCode,
+        nonce: &SsoNonce,
+    ) -> ApiResult<
+    StandardTokenResponse<
+        IdTokenFields<
+            EmptyAdditionalClaims,
+            EmptyExtraTokenFields,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >,
+        CoreTokenType,
+    >> {
+        let oidc_code = AuthorizationCode::new(code.to_string());
+
+        let mut exchange = self.core_client.exchange_code(oidc_code);
+
+        if CONFIG.sso_pkce() {
+            match &nonce.verifier {
+                None => err!(format!("Missing verifier in the DB nonce table")),
+                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
+            }
+        }
+
+        match exchange.request_async(&self.http_client).await {
+            Err(err) => {
+                match &err {
+                    RequestTokenError::Parse(_, response_bytes) => {
+                        let response_body = String::from_utf8_lossy(response_bytes);
+                        let mut parsed: Value = serde_json::from_str(&response_body)?;
+                        if let Some(s) = parsed["expires_in"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["expires_in"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+                        if let Some(s) = parsed["ext_expires_in"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["ext_expires_in"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+                        if let Some(s) = parsed["expires_on"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["expires_on"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+
+                        // Parse back to token response
+                        let token_response = serde_json::from_value(parsed);
+                        match token_response {
+                            Err(err) => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
+                            Ok(token_response) => Ok(token_response),
+                        }
+                    }
+                    _ => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
+                }
+            },
+            Ok(token_response) => Ok(token_response)
+        }
+    }
+
     pub async fn exchange_code(
         &self,
         code: OIDCCode,
@@ -154,26 +217,8 @@ impl Client {
         >,
         IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
     )> {
-        let oidc_code = AuthorizationCode::new(code.to_string());
-
-        let mut exchange = self.core_client.exchange_code(oidc_code);
-
-        if CONFIG.sso_pkce() {
-            match nonce.verifier {
-                None => err!(format!("Missing verifier in the DB nonce table")),
-                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
-            }
-        }
-
-        match exchange.request_async(&self.http_client).await {
-            Err(err) => {
-                match &err {
-                    RequestTokenError::Parse(_, _) => {
-                            err!(format!("Failed to decode token response: {}", err ))
-                    }
-                    _ => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
-                }
-            },
+            match self.perform_code_request(code, &nonce).await {
+            Err(err) => err!(format!("Endpoint response error: {:?}", err)),
             Ok(token_response) => {
                 let oidc_nonce = Nonce::new(nonce.nonce);
 
@@ -205,7 +250,10 @@ impl Client {
     pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<CoreUserInfoClaims> {
         match self.core_client.user_info(access_token, None).request_async(&self.http_client).await {
             Err(err) => err!(format!("Request to user_info endpoint failed: {err}")),
-            Ok(user_info) => Ok(user_info),
+            Ok(user_info) => {
+                debug!("{}", format!("8ashoas {:?}", user_info));
+                Ok(user_info)
+            }
         }
     }
 
