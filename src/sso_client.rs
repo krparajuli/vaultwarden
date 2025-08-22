@@ -17,20 +17,36 @@ use crate::{
 };
 
 static CLIENT_CACHE_KEY: Lazy<String> = Lazy::new(|| "sso-client".to_string());
-static CLIENT_CACHE: Lazy<Cache<String, Client>> = Lazy::new(|| {
+static CLIENT_CACHE: Lazy<Cache<String, EntraSupportedClient>> = Lazy::new(|| {
     Cache::builder().max_capacity(1).time_to_live(Duration::from_secs(CONFIG.sso_client_cache_expiration())).build()
 });
 
+pub type MyIdTokenFields = IdTokenFields<
+    MyAdditionalClaims, // <- replace here
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MyAdditionalClaims {
+   pub upn: String,
+}
+impl AdditionalClaims for MyAdditionalClaims {}
+
+pub type MyTokenResponse = StandardTokenResponse<MyIdTokenFields, CoreTokenType>;
+
 /// OpenID Connect Core client.
-pub type CustomClient = openidconnect::Client<
-    EmptyAdditionalClaims,
+pub type CustomClient = Client<
+    MyAdditionalClaims,
     CoreAuthDisplay,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
     CoreJsonWebKey,
     CoreAuthPrompt,
     StandardErrorResponse<CoreErrorResponseType>,
-    CoreTokenResponse,
+    MyTokenResponse,
     CoreTokenIntrospectionResponse,
     CoreRevocableToken,
     CoreRevocationErrorResponse,
@@ -43,12 +59,12 @@ pub type CustomClient = openidconnect::Client<
 >;
 
 #[derive(Clone)]
-pub struct Client {
+pub struct EntraSupportedClient {
     pub http_client: reqwest::Client,
     pub core_client: CustomClient,
 }
 
-impl Client {
+impl EntraSupportedClient {
     // Call the OpenId discovery endpoint to retrieve configuration
     async fn _get_client() -> ApiResult<Self> {
         let client_id = ClientId::new(CONFIG.sso_client_id());
@@ -66,7 +82,7 @@ impl Client {
             Ok(metadata) => metadata,
         };
 
-        let base_client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
+        let base_client = Client::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
 
         let token_uri = match base_client.token_uri() {
             Some(uri) => uri.clone(),
@@ -83,7 +99,7 @@ impl Client {
             .set_token_uri(token_uri)
             .set_user_info_url(user_info_url);
 
-        Ok(Client {
+        Ok(EntraSupportedClient {
             http_client,
             core_client,
         })
@@ -145,7 +161,7 @@ impl Client {
     ) -> ApiResult<
     StandardTokenResponse<
         IdTokenFields<
-            EmptyAdditionalClaims,
+            MyAdditionalClaims,
             EmptyExtraTokenFields,
             CoreGenderClaim,
             CoreJweContentEncryptionAlgorithm,
@@ -207,7 +223,7 @@ impl Client {
     ) -> ApiResult<(
         StandardTokenResponse<
             IdTokenFields<
-                EmptyAdditionalClaims,
+                MyAdditionalClaims,
                 EmptyExtraTokenFields,
                 CoreGenderClaim,
                 CoreJweContentEncryptionAlgorithm,
@@ -215,7 +231,7 @@ impl Client {
             >,
             CoreTokenType,
         >,
-        IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
+        IdTokenClaims<MyAdditionalClaims, CoreGenderClaim>,
     )> {
             match self.perform_code_request(code, &nonce).await {
             Err(err) => err!(format!("Endpoint response error: {:?}", err)),
@@ -258,7 +274,7 @@ impl Client {
     }
 
     pub async fn check_validity(access_token: String) -> EmptyResult {
-        let client = Client::cached().await?;
+        let client = EntraSupportedClient::cached().await?;
         match client.user_info(AccessToken::new(access_token)).await {
             Err(err) => {
                 err_silent!(format!("Failed to retrieve user info, token has probably been invalidated: {err}"))
@@ -287,7 +303,7 @@ impl Client {
     ) -> ApiResult<(Option<String>, String, Option<Duration>)> {
         let rt = RefreshToken::new(refresh_token);
 
-        let client = Client::cached().await?;
+        let client = EntraSupportedClient::cached().await?;
         let token_response =
             match client.core_client.exchange_refresh_token(&rt).request_async(&client.http_client).await {
                 Err(err) => err!(format!("Request to exchange_refresh_token endpoint failed: {:?}", err)),
