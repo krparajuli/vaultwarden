@@ -1,20 +1,20 @@
 use regex::Regex;
+use serde_json::Value;
 use std::borrow::Cow;
 use std::time::Duration;
 use url::Url;
-use serde_json::Value;
 
-use mini_moka::sync::Cache;
-use once_cell::sync::Lazy;
-use openidconnect::core::*;
-use openidconnect::reqwest;
-use openidconnect::*;
 use crate::{
     api::{ApiResult, EmptyResult},
     db::models::SsoNonce,
     sso::{OIDCCode, OIDCState},
     CONFIG,
 };
+use mini_moka::sync::Cache;
+use once_cell::sync::Lazy;
+use openidconnect::core::*;
+use openidconnect::reqwest;
+use openidconnect::*;
 
 static CLIENT_CACHE_KEY: Lazy<String> = Lazy::new(|| "sso-client".to_string());
 static CLIENT_CACHE: Lazy<Cache<String, Client>> = Lazy::new(|| {
@@ -138,69 +138,6 @@ impl Client {
         Ok((auth_url, SsoNonce::new(state, nonce.secret().clone(), verifier, redirect_uri)))
     }
 
-
-    fn normalize_numeric_fields(&self, response_parsed: &mut Value) {
-        let numeric_fields = ["expires_in", "ext_expires_in", "expires_on"]; // MS Entra fields present as strings
-
-        for field in &numeric_fields {
-            if let Some(field_val) = response_parsed.get_mut(field) {
-                if let Some(string_value) = field_val.as_str() {
-                    if let Ok(num_val) = string_value.parse::<u64>() {
-                        *field_val = Value::Number(num_val.into());
-                    }
-                }
-            }
-        }
-    }
-
-    async fn perform_code_request(
-        &self,
-        code: OIDCCode,
-        nonce: &SsoNonce,
-    ) -> ApiResult<
-    StandardTokenResponse<
-        IdTokenFields<
-            EmptyAdditionalClaims,
-            EmptyExtraTokenFields,
-            CoreGenderClaim,
-            CoreJweContentEncryptionAlgorithm,
-            CoreJwsSigningAlgorithm,
-        >,
-        CoreTokenType,
-    >> {
-        let oidc_code = AuthorizationCode::new(code.to_string());
-
-        let mut exchange = self.core_client.exchange_code(oidc_code);
-
-        if CONFIG.sso_pkce() {
-            match &nonce.verifier {
-                None => err!(format!("Missing verifier in the DB nonce table")),
-                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
-            }
-        }
-
-        match exchange.request_async(&self.http_client).await {
-            Err(err) => {
-                match &err {
-                    RequestTokenError::Parse(_, response_bytes) => {
-                        let response_body = String::from_utf8_lossy(response_bytes);
-                        let mut parsed: Value = serde_json::from_str(&response_body)?;
-                        // Normalize numeric fields which might be present as strings
-                        self.normalize_numeric_fields(&mut parsed);
-                        // Parse back to token response
-                        let token_response = serde_json::from_value(parsed);
-                        match token_response {
-                            Err(err) => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
-                            Ok(token_response) => Ok(token_response),
-                        }
-                    }
-                    _ => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
-                }
-            },
-            Ok(token_response) => Ok(token_response)
-        }
-    }
-
     pub async fn exchange_code(
         &self,
         code: OIDCCode,
@@ -218,7 +155,7 @@ impl Client {
         >,
         IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
     )> {
-            match self.perform_code_request(code, &nonce).await {
+        match self.perform_code_request(code, &nonce).await {
             Err(err) => err!(format!("Endpoint response error: {:?}", err)),
             Ok(token_response) => {
                 let oidc_nonce = Nonce::new(nonce.nonce);
@@ -244,6 +181,87 @@ impl Client {
                 };
 
                 Ok((token_response, id_claims))
+            }
+        }
+    }
+
+    async fn perform_code_request(
+        &self,
+        code: OIDCCode,
+        nonce: &SsoNonce,
+    ) -> ApiResult<
+        StandardTokenResponse<
+            IdTokenFields<
+                EmptyAdditionalClaims,
+                EmptyExtraTokenFields,
+                CoreGenderClaim,
+                CoreJweContentEncryptionAlgorithm,
+                CoreJwsSigningAlgorithm,
+            >,
+            CoreTokenType,
+        >,
+    > {
+        let oidc_code = AuthorizationCode::new(code.to_string());
+
+        let mut exchange = self.core_client.exchange_code(oidc_code);
+
+        if CONFIG.sso_pkce() {
+            match &nonce.verifier {
+                None => err!(format!("Missing verifier in the DB nonce table")),
+                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
+            }
+        }
+
+        match exchange.request_async(&self.http_client).await {
+            Err(err) => self.attempt_parsing_recovery(err),
+            Ok(token_response) => Ok(token_response),
+        }
+    }
+
+    fn attempt_parsing_recovery(
+        &self,
+        error: RequestTokenError<HttpClientError<reqwest::Error>, StandardErrorResponse<CoreErrorResponseType>>,
+    ) -> ApiResult<
+        StandardTokenResponse<
+            IdTokenFields<
+                EmptyAdditionalClaims,
+                EmptyExtraTokenFields,
+                CoreGenderClaim,
+                CoreJweContentEncryptionAlgorithm,
+                CoreJwsSigningAlgorithm,
+            >,
+            CoreTokenType,
+        >,
+    > {
+        match &error {
+            RequestTokenError::Parse(_, response_bytes) => {
+                let response_body = String::from_utf8_lossy(response_bytes);
+                let mut parsed: Value = serde_json::from_str(&response_body)?;
+                // Normalize numeric fields which might be present as strings
+                self.normalize_numeric_fields(&mut parsed);
+                // Parse back to token response
+                let token_response = serde_json::from_value(parsed);
+                match token_response {
+                    Err(err) => {
+                        err!(format!("Failed to parse token endpoint response: {:?}", err))
+                    }
+                    Ok(token_response) => Ok(token_response),
+                }
+            }
+            _ => err!(format!("Failed to contact token endpoint: {:?}", error)),
+        }
+    }
+
+    fn normalize_numeric_fields(&self, response_parsed: &mut Value) {
+        let numeric_fields = ["expires_in", "ext_expires_in", "expires_on"]; // MS Entra fields present as strings
+
+        for field in &numeric_fields {
+            if let Some(field_val) = response_parsed.get_mut(field) {
+                if let Some(string_value) = field_val.as_str() {
+                    if let Ok(num_val) = string_value.parse::<u64>() {
+                        *field_val = Value::Number(num_val.into());
+                    }
+                }
             }
         }
     }
