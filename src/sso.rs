@@ -6,7 +6,7 @@ use url::Url;
 
 use mini_moka::sync::Cache;
 use once_cell::sync::Lazy;
-
+use openidconnect::EndUserEmail;
 use crate::{
     api::ApiResult,
     auth,
@@ -15,7 +15,7 @@ use crate::{
         models::{Device, SsoNonce, User},
         DbConn,
     },
-    sso_client::Client,
+    sso_client::EntraSupportedClient,
     CONFIG,
 };
 
@@ -184,7 +184,7 @@ pub async fn authorize_url(
         _ => err!(format!("Unsupported client {client_id}")),
     };
 
-    let (auth_url, nonce) = Client::authorize_url(state, redirect_uri).await?;
+    let (auth_url, nonce) = EntraSupportedClient::authorize_url(state, redirect_uri).await?;
     nonce.save(&mut conn).await?;
     Ok(auth_url)
 }
@@ -285,14 +285,18 @@ pub async fn exchange_code(wrapped_code: &str, conn: &mut DbConn) -> ApiResult<U
         Some(nonce) => nonce,
     };
 
-    let client = Client::cached().await?;
+    let client = EntraSupportedClient::cached().await?;
     let (token_response, id_claims) = client.exchange_code(code, nonce).await?;
 
     let user_info = client.user_info(token_response.access_token().to_owned()).await?;
 
-    let email = match id_claims.email().or(user_info.email()) {
+    let email = match id_claims.email().or(user_info.email())
+        .or(Some(&EndUserEmail::new(id_claims.additional_claims().upn.clone()))) {
         None => err!("Neither id token nor userinfo contained an email"),
-        Some(e) => e.to_string().to_lowercase(),
+        Some(e) => {
+            debug!("Found ASDSADASDSAAS ");
+            e.to_string().to_lowercase()
+        },
     };
 
     let email_verified = id_claims.email_verified().or(user_info.email_verified());
@@ -424,7 +428,7 @@ pub async fn exchange_refresh_token(
         Some(TokenWrapper::Refresh(refresh_token)) => {
             // Use new refresh_token if returned
             let (new_refresh_token, access_token, expires_in) =
-                Client::exchange_refresh_token(refresh_token.clone()).await?;
+                EntraSupportedClient::exchange_refresh_token(refresh_token.clone()).await?;
 
             create_auth_tokens(
                 device,
@@ -443,7 +447,7 @@ pub async fn exchange_refresh_token(
                 err_silent!("Access token is close to expiration but we have no refresh token")
             }
 
-            Client::check_validity(access_token.clone()).await?;
+            EntraSupportedClient::check_validity(access_token.clone()).await?;
 
             let access_claims = auth::LoginJwtClaims::new(
                 device,

@@ -2,13 +2,13 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::time::Duration;
 use url::Url;
+use serde_json::Value;
 
 use mini_moka::sync::Cache;
 use once_cell::sync::Lazy;
 use openidconnect::core::*;
 use openidconnect::reqwest;
 use openidconnect::*;
-
 use crate::{
     api::{ApiResult, EmptyResult},
     db::models::SsoNonce,
@@ -17,20 +17,36 @@ use crate::{
 };
 
 static CLIENT_CACHE_KEY: Lazy<String> = Lazy::new(|| "sso-client".to_string());
-static CLIENT_CACHE: Lazy<Cache<String, Client>> = Lazy::new(|| {
+static CLIENT_CACHE: Lazy<Cache<String, EntraSupportedClient>> = Lazy::new(|| {
     Cache::builder().max_capacity(1).time_to_live(Duration::from_secs(CONFIG.sso_client_cache_expiration())).build()
 });
 
+pub type MyIdTokenFields = IdTokenFields<
+    MyAdditionalClaims, // <- replace here
+    EmptyExtraTokenFields,
+    CoreGenderClaim,
+    CoreJweContentEncryptionAlgorithm,
+    CoreJwsSigningAlgorithm,
+>;
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MyAdditionalClaims {
+   pub upn: String,
+}
+impl AdditionalClaims for MyAdditionalClaims {}
+
+pub type MyTokenResponse = StandardTokenResponse<MyIdTokenFields, CoreTokenType>;
+
 /// OpenID Connect Core client.
-pub type CustomClient = openidconnect::Client<
-    EmptyAdditionalClaims,
+pub type CustomClient = Client<
+    MyAdditionalClaims,
     CoreAuthDisplay,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
     CoreJsonWebKey,
     CoreAuthPrompt,
     StandardErrorResponse<CoreErrorResponseType>,
-    CoreTokenResponse,
+    MyTokenResponse,
     CoreTokenIntrospectionResponse,
     CoreRevocableToken,
     CoreRevocationErrorResponse,
@@ -43,12 +59,12 @@ pub type CustomClient = openidconnect::Client<
 >;
 
 #[derive(Clone)]
-pub struct Client {
+pub struct EntraSupportedClient {
     pub http_client: reqwest::Client,
     pub core_client: CustomClient,
 }
 
-impl Client {
+impl EntraSupportedClient {
     // Call the OpenId discovery endpoint to retrieve configuration
     async fn _get_client() -> ApiResult<Self> {
         let client_id = ClientId::new(CONFIG.sso_client_id());
@@ -66,7 +82,7 @@ impl Client {
             Ok(metadata) => metadata,
         };
 
-        let base_client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
+        let base_client = Client::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
 
         let token_uri = match base_client.token_uri() {
             Some(uri) => uri.clone(),
@@ -83,7 +99,7 @@ impl Client {
             .set_token_uri(token_uri)
             .set_user_info_url(user_info_url);
 
-        Ok(Client {
+        Ok(EntraSupportedClient {
             http_client,
             core_client,
         })
@@ -138,6 +154,68 @@ impl Client {
         Ok((auth_url, SsoNonce::new(state, nonce.secret().clone(), verifier, redirect_uri)))
     }
 
+    async fn perform_code_request(
+        &self,
+        code: OIDCCode,
+        nonce: &SsoNonce,
+    ) -> ApiResult<
+    StandardTokenResponse<
+        IdTokenFields<
+            MyAdditionalClaims,
+            EmptyExtraTokenFields,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        >,
+        CoreTokenType,
+    >> {
+        let oidc_code = AuthorizationCode::new(code.to_string());
+
+        let mut exchange = self.core_client.exchange_code(oidc_code);
+
+        if CONFIG.sso_pkce() {
+            match &nonce.verifier {
+                None => err!(format!("Missing verifier in the DB nonce table")),
+                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
+            }
+        }
+
+        match exchange.request_async(&self.http_client).await {
+            Err(err) => {
+                match &err {
+                    RequestTokenError::Parse(_, response_bytes) => {
+                        let response_body = String::from_utf8_lossy(response_bytes);
+                        let mut parsed: Value = serde_json::from_str(&response_body)?;
+                        if let Some(s) = parsed["expires_in"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["expires_in"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+                        if let Some(s) = parsed["ext_expires_in"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["ext_expires_in"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+                        if let Some(s) = parsed["expires_on"].as_str() {
+                            if let Ok(num) = s.parse::<u64>() {
+                                parsed["expires_on"] = Value::Number(serde_json::Number::from(num));
+                            }
+                        }
+
+                        // Parse back to token response
+                        let token_response = serde_json::from_value(parsed);
+                        match token_response {
+                            Err(err) => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
+                            Ok(token_response) => Ok(token_response),
+                        }
+                    }
+                    _ => { err!(format!("Failed to contact token endpoint: {:?}", err)) }
+                }
+            },
+            Ok(token_response) => Ok(token_response)
+        }
+    }
+
     pub async fn exchange_code(
         &self,
         code: OIDCCode,
@@ -145,7 +223,7 @@ impl Client {
     ) -> ApiResult<(
         StandardTokenResponse<
             IdTokenFields<
-                EmptyAdditionalClaims,
+                MyAdditionalClaims,
                 EmptyExtraTokenFields,
                 CoreGenderClaim,
                 CoreJweContentEncryptionAlgorithm,
@@ -153,21 +231,10 @@ impl Client {
             >,
             CoreTokenType,
         >,
-        IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
+        IdTokenClaims<MyAdditionalClaims, CoreGenderClaim>,
     )> {
-        let oidc_code = AuthorizationCode::new(code.to_string());
-
-        let mut exchange = self.core_client.exchange_code(oidc_code);
-
-        if CONFIG.sso_pkce() {
-            match nonce.verifier {
-                None => err!(format!("Missing verifier in the DB nonce table")),
-                Some(secret) => exchange = exchange.set_pkce_verifier(PkceCodeVerifier::new(secret.clone())),
-            }
-        }
-
-        match exchange.request_async(&self.http_client).await {
-            Err(err) => err!(format!("Failed to contact token endpoint: {:?}", err)),
+            match self.perform_code_request(code, &nonce).await {
+            Err(err) => err!(format!("Endpoint response error: {:?}", err)),
             Ok(token_response) => {
                 let oidc_nonce = Nonce::new(nonce.nonce);
 
@@ -199,12 +266,15 @@ impl Client {
     pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<CoreUserInfoClaims> {
         match self.core_client.user_info(access_token, None).request_async(&self.http_client).await {
             Err(err) => err!(format!("Request to user_info endpoint failed: {err}")),
-            Ok(user_info) => Ok(user_info),
+            Ok(user_info) => {
+                debug!("{}", format!("8ashoas {:?}", user_info));
+                Ok(user_info)
+            }
         }
     }
 
     pub async fn check_validity(access_token: String) -> EmptyResult {
-        let client = Client::cached().await?;
+        let client = EntraSupportedClient::cached().await?;
         match client.user_info(AccessToken::new(access_token)).await {
             Err(err) => {
                 err_silent!(format!("Failed to retrieve user info, token has probably been invalidated: {err}"))
@@ -233,7 +303,7 @@ impl Client {
     ) -> ApiResult<(Option<String>, String, Option<Duration>)> {
         let rt = RefreshToken::new(refresh_token);
 
-        let client = Client::cached().await?;
+        let client = EntraSupportedClient::cached().await?;
         let token_response =
             match client.core_client.exchange_refresh_token(&rt).request_async(&client.http_client).await {
                 Err(err) => err!(format!("Request to exchange_refresh_token endpoint failed: {:?}", err)),
