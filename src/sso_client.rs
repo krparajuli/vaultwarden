@@ -251,10 +251,7 @@ impl Client {
     pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<CoreUserInfoClaims> {
         match self.core_client.user_info(access_token, None).request_async(&self.http_client).await {
             Err(err) => err!(format!("Request to user_info endpoint failed: {err}")),
-            Ok(user_info) => {
-                debug!("{}", format!("8ashoas {:?}", user_info));
-                Ok(user_info)
-            }
+            Ok(user_info) => Ok(user_info),
         }
     }
 
