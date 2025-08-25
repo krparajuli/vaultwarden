@@ -290,10 +290,9 @@ pub async fn exchange_code(wrapped_code: &str, conn: &mut DbConn) -> ApiResult<U
 
     let user_info = client.user_info(token_response.access_token().to_owned()).await?;
 
-    let email = match id_claims.email().or(user_info.email()).or(id_claims.claim("upn")) {
+    let email = match id_claims.email().or(user_info.email()) {
         None => err!("Neither id token nor userinfo contained an email"),
         Some(e) => {
-            debug!("Found ASDSADASDSAAS ");
             e.to_string().to_lowercase()
         },
     };

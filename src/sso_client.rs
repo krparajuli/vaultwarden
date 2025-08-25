@@ -138,6 +138,21 @@ impl Client {
         Ok((auth_url, SsoNonce::new(state, nonce.secret().clone(), verifier, redirect_uri)))
     }
 
+
+    fn normalize_numeric_fields(&self, response_parsed: &mut Value) {
+        let numeric_fields = ["expires_in", "ext_expires_in", "expires_on"]; // MS Entra fields present as strings
+
+        for field in &numeric_fields {
+            if let Some(field_val) = response_parsed.get_mut(field) {
+                if let Some(string_value) = field_val.as_str() {
+                    if let Ok(num_val) = string_value.parse::<u64>() {
+                        *field_val = Value::Number(num_val.into());
+                    }
+                }
+            }
+        }
+    }
+
     async fn perform_code_request(
         &self,
         code: OIDCCode,
@@ -170,22 +185,8 @@ impl Client {
                     RequestTokenError::Parse(_, response_bytes) => {
                         let response_body = String::from_utf8_lossy(response_bytes);
                         let mut parsed: Value = serde_json::from_str(&response_body)?;
-                        if let Some(s) = parsed["expires_in"].as_str() {
-                            if let Ok(num) = s.parse::<u64>() {
-                                parsed["expires_in"] = Value::Number(serde_json::Number::from(num));
-                            }
-                        }
-                        if let Some(s) = parsed["ext_expires_in"].as_str() {
-                            if let Ok(num) = s.parse::<u64>() {
-                                parsed["ext_expires_in"] = Value::Number(serde_json::Number::from(num));
-                            }
-                        }
-                        if let Some(s) = parsed["expires_on"].as_str() {
-                            if let Ok(num) = s.parse::<u64>() {
-                                parsed["expires_on"] = Value::Number(serde_json::Number::from(num));
-                            }
-                        }
-
+                        // Normalize numeric fields which might be present as strings
+                        self.normalize_numeric_fields(&mut parsed);
                         // Parse back to token response
                         let token_response = serde_json::from_value(parsed);
                         match token_response {
