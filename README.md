@@ -1,5 +1,8 @@
 ![Vaultwarden Logo](./resources/vaultwarden-logo-auto.svg)
 
+**THIS IS A FORK OF VAULTWARDEN PROJECT WHICH SUPPORTS ENTRA SSO. THIS IS REQUIRED DUE TO POOR OAUTH/OIDC IMPLEMENTATION ON ENTRA SSO.**
+**PLEASE USE AND SUPPORT THE ORIGINAL VAULTWARDEN PROJECT IF YOU DO NOT REQUIRE ENTRA SSO.**
+
 An alternative server implementation of the Bitwarden Client API, written in Rust and compatible with [official Bitwarden clients](https://bitwarden.com/download/) [[disclaimer](#disclaimer)], perfect for self-hosted deployment where running the official resource-heavy service might not be ideal.
 
 ---
