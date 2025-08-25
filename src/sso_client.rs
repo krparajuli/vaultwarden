@@ -213,13 +213,12 @@ impl Client {
         }
 
         match exchange.request_async(&self.http_client).await {
-            Err(err) => self.attempt_parsing_recovery(err),
+            Err(err) => Self::attempt_parsing_recovery(err),
             Ok(token_response) => Ok(token_response),
         }
     }
 
     fn attempt_parsing_recovery(
-        &self,
         error: RequestTokenError<HttpClientError<reqwest::Error>, StandardErrorResponse<CoreErrorResponseType>>,
     ) -> ApiResult<
         StandardTokenResponse<
@@ -238,7 +237,7 @@ impl Client {
                 let response_body = String::from_utf8_lossy(response_bytes);
                 let mut parsed: Value = serde_json::from_str(&response_body)?;
                 // Normalize numeric fields which might be present as strings
-                self.normalize_numeric_fields(&mut parsed);
+                Self::normalize_numeric_fields(&mut parsed);
                 // Parse back to token response
                 let token_response = serde_json::from_value(parsed);
                 match token_response {
@@ -248,11 +247,11 @@ impl Client {
                     Ok(token_response) => Ok(token_response),
                 }
             }
-            _ => err!(format!("Failed to contact token endpoint: {:?}", error)),
+            _ => err!(format!("Failed to contact access token endpoint: {:?}", error)),
         }
     }
 
-    fn normalize_numeric_fields(&self, response_parsed: &mut Value) {
+    fn normalize_numeric_fields(response_parsed: &mut Value) {
         let numeric_fields = ["expires_in", "ext_expires_in", "expires_on"]; // MS Entra fields present as strings
 
         for field in &numeric_fields {
@@ -297,7 +296,7 @@ impl Client {
         }
         verifier
     }
-
+    
     pub async fn exchange_refresh_token(
         refresh_token: String,
     ) -> ApiResult<(Option<String>, String, Option<Duration>)> {
@@ -306,16 +305,22 @@ impl Client {
         let client = Client::cached().await?;
         let token_response =
             match client.core_client.exchange_refresh_token(&rt).request_async(&client.http_client).await {
-                Err(err) => err!(format!("Request to exchange_refresh_token endpoint failed: {:?}", err)),
-                Ok(token_response) => token_response,
+                Err(err) => Self::attempt_parsing_recovery(err),
+                Ok(token_response) => Ok(token_response),
             };
-
-        Ok((
-            token_response.refresh_token().map(|token| token.secret().clone()),
-            token_response.access_token().secret().clone(),
-            token_response.expires_in(),
-        ))
+        
+        match token_response {
+            Err(err) => err!(format!("Request to exchange_refresh_token endpoint failed: {:?}", err)),
+            Ok(token_response) =>
+                Ok((
+                token_response.refresh_token().map(|token| token.secret().clone()),
+                token_response.access_token().secret().clone(),
+                token_response.expires_in(),
+            ))
+        }
     }
+    
+    
 }
 
 trait AuthorizationRequestExt<'a> {
